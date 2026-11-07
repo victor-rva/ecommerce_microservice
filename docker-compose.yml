@@ -57,9 +57,13 @@ services:
       FRAUD_SERVICE_URL: http://fraud-service:3005
       PAYMENT_SERVICE_URL: http://payment-service:3006
       NOTIFICATION_SERVICE_URL: http://notification-service:3007
+      RABBITMQ_API_URL: http://rabbitmq:15672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
     volumes:
       - ./order-service/data:/app/data
     depends_on:
+      - rabbitmq
       - product-service
       - pricing-service
       - inventory-service
@@ -106,8 +110,13 @@ services:
       - "3007:3007"
     environment:
       PORT: 3007
+      RABBITMQ_API_URL: http://rabbitmq:15672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
     volumes:
       - ./notification-service/data:/app/data
+    depends_on:
+      - rabbitmq
 
   user-simulator:
     build: ./user-simulator
@@ -137,36 +146,5 @@ services:
       - ./payment-service/data:/dbs/payment-service
       - ./notification-service/data:/dbs/notification-service
       - ./api-gateway/data:/dbs/api-gateway
-    depends_on:
-      - api-gateway
-
-
-  user-simulator:
-    build: ./user-simulator
-    container_name: ecommerce-user-simulator
-    ports:
-      - "3080:3080"
-    environment:
-      PORT: 3080
-      GATEWAY_URL: http://api-gateway:3000
-      AUTO_START: "true"
-      PRODUCTS_DB_PATH: /mnt/products/products.db
-      INVENTORY_DB_PATH: /mnt/inventory/inventory.db
-      PRICING_DB_PATH: /mnt/pricing/pricing.db
-      ORDERS_DB_PATH: /mnt/orders/orders.db
-      FRAUD_DB_PATH: /mnt/fraud/fraud.db
-      PAYMENTS_DB_PATH: /mnt/payments/payments.db
-      NOTIFICATIONS_DB_PATH: /mnt/notifications/notifications.db
-      GATEWAY_DB_PATH: /mnt/gateway/gateway.db
-    volumes:
-      - ./user-simulator/data:/app/data
-      - ./product-service/data:/mnt/products
-      - ./inventory-service/data:/mnt/inventory
-      - ./pricing-service/data:/mnt/pricing
-      - ./order-service/data:/mnt/orders
-      - ./fraud-service/data:/mnt/fraud
-      - ./payment-service/data:/mnt/payments
-      - ./notification-service/data:/mnt/notifications
-      - ./api-gateway/data:/mnt/gateway
     depends_on:
       - api-gateway
