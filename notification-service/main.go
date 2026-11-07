@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -11,9 +12,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+)
+
+const OrderConfirmedQueue = "order.confirmed"
+
+var (
+	rabbitConnected     atomic.Bool
+	rabbitConsumedCount atomic.Int64
 )
 
 // SqliteStore gerencia a persistência isolada do notification-service em data/notifications.db
@@ -107,7 +117,7 @@ func (s *SqliteStore) initSchema() {
 	}
 }
 
-// OrderConfirmedPayload representa o contrato recebido do order-service (Saga Step 7)
+// OrderConfirmedPayload representa o contrato recebido do order-service (via fila RabbitMQ 'order.confirmed' ou fallback HTTP)
 type OrderConfirmedPayload struct {
 	Event                string  `json:"event"`
 	OrderID              int64   `json:"orderId"`
@@ -182,11 +192,205 @@ func sendJSON(w http.ResponseWriter, status int, payload interface{}) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
+// issueInvoiceAndNotify processa de forma idempotente a emissão da NF-e e o disparo de notificação
+// tanto quando consumido da fila RabbitMQ ('order.confirmed') quanto via Fallback HTTP.
+func issueInvoiceAndNotify(store *SqliteStore, payload OrderConfirmedPayload, corrID string, deliverySource string) map[string]interface{} {
+	// Idempotência: se o pedido já teve NF-e emitida (ex: já processado pela fila RabbitMQ), retorna o registro existente
+	existing, _ := store.execQuery("SELECT * FROM invoices WHERE order_id = ? LIMIT 1", payload.OrderID)
+	if len(existing) > 0 {
+		inv := existing[0]
+		return map[string]interface{}{
+			"service":        "notification-service",
+			"language":       "Go 1.22",
+			"deliverySource": deliverySource,
+			"orderId":        payload.OrderID,
+			"invoice": map[string]interface{}{
+				"invoiceNumber":         inv["invoice_number"],
+				"series":                inv["series"],
+				"accessKey":             inv["access_key"],
+				"authorizationProtocol": inv["authorization_protocol"],
+				"status":                inv["status"],
+				"subtotal":              inv["subtotal"],
+				"discountAmount":        inv["discount_amount"],
+				"taxAmount":             inv["tax_amount"],
+				"totalValue":            inv["total_price"],
+				"issuedAt":              inv["issued_at"],
+			},
+		}
+	}
+
+	now := time.Now().UTC()
+	nowISO := now.Format(time.RFC3339)
+	if corrID == "" {
+		corrID = payload.CorrelationID
+	}
+	if corrID == "" {
+		corrID = "notif-" + randomHex(4)
+	}
+
+	invoiceNumber := fmt.Sprintf("NFE-%d-%06d-%s", now.Year(), payload.OrderID, randomHex(2))
+	series := "001"
+	accessKey := generateSefazAccessKey(payload.OrderID, now)
+	protocol := fmt.Sprintf("135%s%07d", now.Format("06"), payload.OrderID%10000000)
+	notifID := fmt.Sprintf("NTF-%s", randomHex(5))
+	recipient := fmt.Sprintf("customer.%d@ecommerce.local", payload.UserID)
+	subject := fmt.Sprintf("Pedido #%d Confirmado - NF-e %s Emitida", payload.OrderID, invoiceNumber)
+
+	if payload.ProductName == "" {
+		payload.ProductName = "Item E-Commerce"
+	}
+	if payload.Quantity <= 0 {
+		payload.Quantity = 1
+	}
+
+	_, err := store.execQuery(
+		`INSERT INTO invoices (
+			invoice_number, series, access_key, authorization_protocol,
+			order_id, correlation_id, user_id, product_name, quantity,
+			subtotal, discount_amount, tax_amount, total_price,
+			payment_transaction_id, status, issued_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AUTHORIZED_SEFAZ', ?)`,
+		invoiceNumber, series, accessKey, protocol,
+		payload.OrderID, corrID, payload.UserID, payload.ProductName, payload.Quantity,
+		payload.Subtotal, payload.DiscountAmount, payload.TaxAmount, payload.TotalPrice,
+		payload.PaymentTransactionID, nowISO,
+	)
+	if err != nil {
+		log.Printf("[Notification Service - Go] Erro ao gravar NF-e no SQLite: %v", err)
+	}
+
+	channelLabel := "EMAIL_AND_WEBHOOK (" + deliverySource + ")"
+	_, _ = store.execQuery(
+		`INSERT INTO notification_logs (
+			notification_id, order_id, user_id, channel, recipient,
+			subject, invoice_access_key, status, sent_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'DISPATCHED', ?)`,
+		notifID, payload.OrderID, payload.UserID, channelLabel, recipient, subject, accessKey, nowISO,
+	)
+
+	log.Printf("[Notification Service - Go] [%s] [CorrID: %s] Order #%d -> NF-e %s (Chave 44 dígitos: %s)",
+		deliverySource, corrID, payload.OrderID, invoiceNumber, accessKey)
+
+	return map[string]interface{}{
+		"service":        "notification-service",
+		"language":       "Go 1.22",
+		"deliverySource": deliverySource,
+		"orderId":        payload.OrderID,
+		"invoice": map[string]interface{}{
+			"invoiceNumber":         invoiceNumber,
+			"series":                series,
+			"accessKey":             accessKey,
+			"authorizationProtocol": protocol,
+			"status":                "AUTHORIZED_SEFAZ",
+			"subtotal":              payload.Subtotal,
+			"discountAmount":        payload.DiscountAmount,
+			"taxAmount":             payload.TaxAmount,
+			"totalValue":            payload.TotalPrice,
+			"issuedAt":              nowISO,
+		},
+		"notification": map[string]interface{}{
+			"notificationId": notifID,
+			"channel":        channelLabel,
+			"recipient":      recipient,
+			"subject":        subject,
+			"status":         "DISPATCHED",
+			"sentAt":         nowISO,
+		},
+	}
+}
+
+// startRabbitMQConsumer inicia um worker em goroutine que declara e consome da fila 'order.confirmed' no RabbitMQ.
+// Se o RabbitMQ não estiver rodando (ex: execução local via .ps1 sem Docker), entra em espera silenciosa mantendo o fallback HTTP ativo.
+func startRabbitMQConsumer(store *SqliteStore) {
+	rabbitAPI := strings.TrimRight(getEnv("RABBITMQ_API_URL", "http://127.0.0.1:15672"), "/")
+	rabbitUser := getEnv("RABBITMQ_USER", "guest")
+	rabbitPass := getEnv("RABBITMQ_PASS", "guest")
+
+	client := &http.Client{Timeout: 2500 * time.Millisecond}
+	queueDeclared := false
+	loggedConnected := false
+
+	for {
+		if !queueDeclared {
+			declareBody := []byte(`{"auto_delete":false,"durable":true,"arguments":{}}`)
+			req, err := http.NewRequest(http.MethodPut, rabbitAPI+"/api/queues/%2F/"+OrderConfirmedQueue, bytes.NewReader(declareBody))
+			if err == nil {
+				req.SetBasicAuth(rabbitUser, rabbitPass)
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := client.Do(req)
+				if err == nil {
+					_ = resp.Body.Close()
+					if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+						queueDeclared = true
+						rabbitConnected.Store(true)
+						if !loggedConnected {
+							log.Printf("[Notification Service - Go] Conectado ao RabbitMQ (%s) | Consumindo fila '%s'", rabbitAPI, OrderConfirmedQueue)
+							loggedConnected = true
+						}
+					}
+				}
+			}
+			if !queueDeclared {
+				rabbitConnected.Store(false)
+				time.Sleep(3 * time.Second)
+				continue
+			}
+		}
+
+		// Consome até 10 mensagens por ciclo da fila 'order.confirmed' com ACK automático ao processar
+		getBody := []byte(`{"count":10,"ackmode":"ack_requeue_false","encoding":"auto","truncate":50000}`)
+		req, err := http.NewRequest(http.MethodPost, rabbitAPI+"/api/queues/%2F/"+OrderConfirmedQueue+"/get", bytes.NewReader(getBody))
+		if err != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		req.SetBasicAuth(rabbitUser, rabbitPass)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			rabbitConnected.Store(false)
+			queueDeclared = false
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_ = resp.Body.Close()
+			rabbitConnected.Store(false)
+			queueDeclared = false
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		rabbitConnected.Store(true)
+		var messages []struct {
+			Payload string `json:"payload"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&messages)
+		_ = resp.Body.Close()
+
+		if err == nil && len(messages) > 0 {
+			for _, msg := range messages {
+				var payload OrderConfirmedPayload
+				if err := json.Unmarshal([]byte(msg.Payload), &payload); err == nil && payload.OrderID > 0 {
+					issueInvoiceAndNotify(store, payload, payload.CorrelationID, "RABBITMQ_QUEUE ("+OrderConfirmedQueue+")")
+					rabbitConsumedCount.Add(1)
+				}
+			}
+		}
+
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
 func main() {
 	port := getEnv("PORT", "3007")
 	dbPath := getEnv("SQLITE_DB_PATH", filepath.Join("data", "notifications.db"))
 
 	store := NewSqliteStore(dbPath)
+	go startRabbitMQConsumer(store)
+
 	mux := http.NewServeMux()
 
 	// GET /health
@@ -219,6 +423,12 @@ func main() {
 				"removedRuntime": "PHP (Removido devido a falha de segurança crítica em todas as versões)",
 				"activeRuntime":  "Go (Binário nativo compilado estaticamente sem interpretador CGI/Zend)",
 				"status":         "MITIGATED",
+			},
+			"rabbitmq": map[string]interface{}{
+				"queue":            OrderConfirmedQueue,
+				"connected":        rabbitConnected.Load(),
+				"messagesConsumed": rabbitConsumedCount.Load(),
+				"fallbackMode":     "HTTP POST /notifications/order-confirmed",
 			},
 			"status":                 "UP",
 			"database":               dbPath,
@@ -253,7 +463,46 @@ func main() {
 		sendJSON(w, http.StatusOK, invoices)
 	})
 
-	// POST /notifications/order-confirmed (Passo 7 da Saga)
+	// GET /notifications/order/{orderId} (Consulta NF-e gerada pelo consumidor RabbitMQ para um pedido específico)
+	mux.HandleFunc("/notifications/order/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method Not Allowed"})
+			return
+		}
+		orderIDStr := strings.TrimPrefix(r.URL.Path, "/notifications/order/")
+		orderID, err := strconv.ParseInt(orderIDStr, 10, 64)
+		if err != nil || orderID <= 0 {
+			sendJSON(w, http.StatusBadRequest, map[string]string{"message": "orderId inválido"})
+			return
+		}
+
+		existing, _ := store.execQuery("SELECT * FROM invoices WHERE order_id = ? LIMIT 1", orderID)
+		if len(existing) == 0 {
+			sendJSON(w, http.StatusNotFound, map[string]string{"message": "NF-e ainda em processamento na fila"})
+			return
+		}
+		inv := existing[0]
+		sendJSON(w, http.StatusOK, map[string]interface{}{
+			"service":        "notification-service",
+			"language":       "Go 1.22",
+			"deliverySource": "RABBITMQ_QUEUE (" + OrderConfirmedQueue + ")",
+			"orderId":        orderID,
+			"invoice": map[string]interface{}{
+				"invoiceNumber":         inv["invoice_number"],
+				"series":                inv["series"],
+				"accessKey":             inv["access_key"],
+				"authorizationProtocol": inv["authorization_protocol"],
+				"status":                inv["status"],
+				"subtotal":              inv["subtotal"],
+				"discountAmount":        inv["discount_amount"],
+				"taxAmount":             inv["tax_amount"],
+				"totalValue":            inv["total_price"],
+				"issuedAt":              inv["issued_at"],
+			},
+		})
+	})
+
+	// POST /notifications/order-confirmed (Fallback HTTP caso o RabbitMQ não esteja rodando no modo .ps1)
 	mux.HandleFunc("/notifications/order-confirmed", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSON(w, http.StatusMethodNotAllowed, map[string]string{"message": "Method Not Allowed"})
@@ -276,85 +525,9 @@ func main() {
 			return
 		}
 
-		now := time.Now().UTC()
-		nowISO := now.Format(time.RFC3339)
 		corrID := r.Header.Get("X-Correlation-ID")
-		if corrID == "" {
-			corrID = payload.CorrelationID
-		}
-		if corrID == "" {
-			corrID = "notif-" + randomHex(4)
-		}
-
-		invoiceNumber := fmt.Sprintf("NFE-%d-%06d-%s", now.Year(), payload.OrderID, randomHex(2))
-		series := "001"
-		accessKey := generateSefazAccessKey(payload.OrderID, now)
-		protocol := fmt.Sprintf("135%s%07d", now.Format("06"), payload.OrderID%10000000)
-		notifID := fmt.Sprintf("NTF-%s", randomHex(5))
-		recipient := fmt.Sprintf("customer.%d@ecommerce.local", payload.UserID)
-		subject := fmt.Sprintf("Pedido #%d Confirmado - NF-e %s Emitida", payload.OrderID, invoiceNumber)
-
-		if payload.ProductName == "" {
-			payload.ProductName = "Item E-Commerce"
-		}
-		if payload.Quantity <= 0 {
-			payload.Quantity = 1
-		}
-
-		go func(p OrderConfirmedPayload, invNum, ser, accKey, prot, cID, nID, rec, subj, ts string) {
-			_, err := store.execQuery(
-				`INSERT INTO invoices (
-					invoice_number, series, access_key, authorization_protocol,
-					order_id, correlation_id, user_id, product_name, quantity,
-					subtotal, discount_amount, tax_amount, total_price,
-					payment_transaction_id, status, issued_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AUTHORIZED_SEFAZ', ?)`,
-				invNum, ser, accKey, prot,
-				p.OrderID, cID, p.UserID, p.ProductName, p.Quantity,
-				p.Subtotal, p.DiscountAmount, p.TaxAmount, p.TotalPrice,
-				p.PaymentTransactionID, ts,
-			)
-			if err != nil {
-				log.Printf("[Notification Service - Go] Erro ao gravar NF-e no SQLite: %v", err)
-			}
-
-			_, _ = store.execQuery(
-				`INSERT INTO notification_logs (
-					notification_id, order_id, user_id, channel, recipient,
-					subject, invoice_access_key, status, sent_at
-				) VALUES (?, ?, ?, 'EMAIL_AND_WEBHOOK', ?, ?, ?, 'DISPATCHED', ?)`,
-				nID, p.OrderID, p.UserID, rec, subj, accKey, ts,
-			)
-		}(payload, invoiceNumber, series, accessKey, protocol, corrID, notifID, recipient, subject, nowISO)
-
-		log.Printf("[Notification Service - Go] [CorrID: %s] Order #%d -> NF-e %s (Chave 44 dígitos: %s)",
-			corrID, payload.OrderID, invoiceNumber, accessKey)
-
-		sendJSON(w, http.StatusCreated, map[string]interface{}{
-			"service":  "notification-service",
-			"language": "Go 1.22",
-			"orderId":  payload.OrderID,
-			"invoice": map[string]interface{}{
-				"invoiceNumber":         invoiceNumber,
-				"series":                series,
-				"accessKey":             accessKey,
-				"authorizationProtocol": protocol,
-				"status":                "AUTHORIZED_SEFAZ",
-				"subtotal":              payload.Subtotal,
-				"discountAmount":        payload.DiscountAmount,
-				"taxAmount":             payload.TaxAmount,
-				"totalValue":            payload.TotalPrice,
-				"issuedAt":              nowISO,
-			},
-			"notification": map[string]interface{}{
-				"notificationId": notifID,
-				"channel":        "EMAIL_AND_WEBHOOK",
-				"recipient":      recipient,
-				"subject":        subject,
-				"status":         "DISPATCHED",
-				"sentAt":         nowISO,
-			},
-		})
+		result := issueInvoiceAndNotify(store, payload, corrID, "HTTP_FALLBACK")
+		sendJSON(w, http.StatusCreated, result)
 	})
 
 	server := &http.Server{
@@ -366,7 +539,7 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	fmt.Printf("[Notification Service - Go] Rodando na porta %s | SQLite: %s (Substituto seguro do PHP)\n", port, dbPath)
+	fmt.Printf("[Notification Service - Go] Rodando na porta %s | SQLite: %s | Fila RabbitMQ: %s\n", port, dbPath, OrderConfirmedQueue)
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Erro ao iniciar Notification Service: %v", err)
 	}

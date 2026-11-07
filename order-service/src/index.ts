@@ -19,6 +19,98 @@ const FRAUD_SERVICE_URL = process.env.FRAUD_SERVICE_URL || 'http://127.0.0.1:300
 const PAYMENT_SERVICE_URL = process.env.PAYMENT_SERVICE_URL || 'http://127.0.0.1:3006';
 const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || 'http://127.0.0.1:3007';
 
+// Configuração do RabbitMQ (Fila 'order.confirmed' para o Transactional Outbox do Passo 7)
+const RABBITMQ_API_URL = (process.env.RABBITMQ_API_URL || 'http://127.0.0.1:15672').replace(/\/$/, '');
+const RABBITMQ_USER = process.env.RABBITMQ_USER || 'guest';
+const RABBITMQ_PASS = process.env.RABBITMQ_PASS || 'guest';
+const ORDER_CONFIRMED_QUEUE = 'order.confirmed';
+
+let rabbitQueueDeclared = false;
+let rabbitPublishedCount = 0;
+let rabbitOnline = false;
+
+async function publishToRabbitMQQueue(eventPayload: Record<string, any>): Promise<boolean> {
+    const auth = { username: RABBITMQ_USER, password: RABBITMQ_PASS };
+    try {
+        if (!rabbitQueueDeclared) {
+            await axios.put(
+                `${RABBITMQ_API_URL}/api/queues/%2F/${ORDER_CONFIRMED_QUEUE}`,
+                { auto_delete: false, durable: true, arguments: {} },
+                { auth, timeout: 1500 }
+            );
+            rabbitQueueDeclared = true;
+        }
+
+        const pubRes = await axios.post(
+            `${RABBITMQ_API_URL}/api/exchanges/%2F/amq.default/publish`,
+            {
+                properties: {
+                    delivery_mode: 2,
+                    content_type: 'application/json',
+                    correlation_id: eventPayload.correlationId
+                },
+                routing_key: ORDER_CONFIRMED_QUEUE,
+                payload: JSON.stringify(eventPayload),
+                payload_encoding: 'string'
+            },
+            { auth, timeout: 1500 }
+        );
+
+        if (pubRes.data && pubRes.data.routed) {
+            rabbitOnline = true;
+            rabbitPublishedCount++;
+            return true;
+        }
+        return false;
+    } catch {
+        rabbitQueueDeclared = false;
+        rabbitOnline = false;
+        return false;
+    }
+}
+
+async function waitForRabbitConsumerInvoice(orderId: number, headers: Record<string, string>): Promise<any | null> {
+    for (let attempt = 1; attempt <= 8; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 120));
+        try {
+            const res = await axios.get(`${NOTIFICATION_SERVICE_URL}/notifications/order/${orderId}`, {
+                headers,
+                timeout: 1500
+            });
+            if (res.status === 200 && res.data?.invoice) {
+                return res.data;
+            }
+        } catch {
+            // Continua aguardando o consumidor Go processar a mensagem da fila
+        }
+    }
+    return null;
+}
+
+// Worker em background do Transactional Outbox Relay: reprocessa eventos com published = 0
+setInterval(async () => {
+    try {
+        const pendingEvents = db.execSql('SELECT * FROM outbox_events WHERE published = 0');
+        for (const ev of pendingEvents) {
+            const payload = JSON.parse(ev.payload || '{}');
+            const orderId = Number(ev.aggregateId);
+            const publishedViaRabbit = await publishToRabbitMQQueue(payload);
+            if (publishedViaRabbit) {
+                db.execSql('UPDATE outbox_events SET published = ? WHERE aggregateId = ?', [1, orderId]);
+                continue;
+            }
+            try {
+                await axios.post(`${NOTIFICATION_SERVICE_URL}/notifications/order-confirmed`, payload, { timeout: 3000 });
+                db.execSql('UPDATE outbox_events SET published = ? WHERE aggregateId = ?', [1, orderId]);
+            } catch {
+                // Permanece published = 0 para próxima tentativa
+            }
+        }
+    } catch {
+        // Ignora erros transitórios no loop do Outbox Relay
+    }
+}, 5000);
+
 // Mitigação em camada de aplicação contra CVE-2026-111497 (Node2Shell / Brotli RCE no zlib)
 // Bloqueia payloads com Content-Encoding/Transfer-Encoding 'br' antes do body-parser invocar o decodificador nativo Brotli
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -47,6 +139,13 @@ app.get('/health', (_req: Request, res: Response) => {
         securityPatchStatus: {
             cve: 'CVE-2026-111497',
             brotliGuard: 'ACTIVE'
+        },
+        rabbitmqOutbox: {
+            queue: ORDER_CONFIRMED_QUEUE,
+            rabbitApiUrl: RABBITMQ_API_URL,
+            connected: rabbitOnline,
+            publishedToQueue: rabbitPublishedCount,
+            fallbackMode: 'HTTP POST /notifications/order-confirmed'
         },
         status: 'UP',
         database: DB_PATH,
@@ -335,8 +434,8 @@ app.post('/orders', async (req: Request, res: Response) => {
         }
 
         // =========================================================================
-        // PASSO 7: Emitir Nota Fiscal (NFe) e Notificação em Go (:3007) + Outbox Event
-        // (Migrado de PHP para Go devido a falha de segurança em todas as versões do PHP)
+        // PASSO 7: Transactional Outbox -> Fila RabbitMQ ('order.confirmed') -> Go (:3007)
+        // Mantém Fallback HTTP automático caso o RabbitMQ não esteja rodando no modo .ps1
         // =========================================================================
         let invoiceData: any = null;
         const eventPayload = {
@@ -354,25 +453,63 @@ app.post('/orders', async (req: Request, res: Response) => {
             confirmedAt: new Date().toISOString()
         };
 
+        // 7.1. Grava evento no Transactional Outbox inicialmente como published = 0
         db.execSql(
             `INSERT INTO outbox_events (aggregateId, eventType, payload, published, createdAt)
-             VALUES (?, 'OrderConfirmedEvent', ?, 1, ?)`,
-            [orderId, JSON.stringify(eventPayload), new Date().toISOString()]
+             VALUES (?, 'OrderConfirmedEvent', ?, ?, ?)`,
+            [orderId, JSON.stringify(eventPayload), 0, new Date().toISOString()]
         );
 
-        try {
-            const notifRes = await axios.post(
-                `${NOTIFICATION_SERVICE_URL}/notifications/order-confirmed`,
-                eventPayload,
-                { headers, timeout: 4000 }
-            );
-            invoiceData = notifRes.data;
-            logSagaStep(orderId, stepCounter++, 'notification-service', 'Go', 'ISSUE_NFE_AND_NOTIFY', 'SUCCESS', invoiceData);
-        } catch (err: any) {
-            logSagaStep(orderId, stepCounter++, 'notification-service', 'Go', 'ISSUE_NFE_AND_NOTIFY', 'FAILED', {
-                note: 'Outbox gravado para reprocessamento assíncrono',
-                error: err.message
+        // 7.2. Tenta publicar na fila real do RabbitMQ ('order.confirmed')
+        const publishedToRabbit = await publishToRabbitMQQueue(eventPayload);
+
+        if (publishedToRabbit) {
+            db.execSql('UPDATE outbox_events SET published = ? WHERE aggregateId = ?', [1, orderId]);
+
+            // Aguarda brevemente o consumidor Go processar a mensagem da fila 'order.confirmed'
+            invoiceData = await waitForRabbitConsumerInvoice(orderId, headers);
+
+            if (!invoiceData) {
+                // Caso o ciclo do consumidor Go ainda não tenha fechado, garante a emissão idempotente via HTTP
+                try {
+                    const notifRes = await axios.post(
+                        `${NOTIFICATION_SERVICE_URL}/notifications/order-confirmed`,
+                        eventPayload,
+                        { headers, timeout: 4000 }
+                    );
+                    invoiceData = notifRes.data;
+                } catch {
+                    // O consumidor do RabbitMQ processará em background
+                }
+            }
+
+            logSagaStep(orderId, stepCounter++, 'notification-service', 'Go', 'ISSUE_NFE_VIA_RABBITMQ', 'SUCCESS', {
+                broker: 'RabbitMQ',
+                queue: ORDER_CONFIRMED_QUEUE,
+                outboxPublished: true,
+                ...(invoiceData || {})
             });
+        } else {
+            // 7.3. Fallback HTTP automático (quando executado localmente via .ps1 sem o container do RabbitMQ)
+            try {
+                const notifRes = await axios.post(
+                    `${NOTIFICATION_SERVICE_URL}/notifications/order-confirmed`,
+                    eventPayload,
+                    { headers, timeout: 4000 }
+                );
+                invoiceData = notifRes.data;
+                db.execSql('UPDATE outbox_events SET published = ? WHERE aggregateId = ?', [1, orderId]);
+                logSagaStep(orderId, stepCounter++, 'notification-service', 'Go', 'ISSUE_NFE_HTTP_FALLBACK', 'SUCCESS', {
+                    deliveryMode: 'HTTP_FALLBACK (RabbitMQ Offline)',
+                    outboxPublished: true,
+                    ...invoiceData
+                });
+            } catch (err: any) {
+                logSagaStep(orderId, stepCounter++, 'notification-service', 'Go', 'ISSUE_NFE_AND_NOTIFY', 'FAILED', {
+                    note: 'Outbox gravado (published=0) para reprocessamento assíncrono pelo Outbox Relay',
+                    error: err.message
+                });
+            }
         }
 
         // Atualiza pedido para CONFIRMED
@@ -424,6 +561,10 @@ app.post('/orders', async (req: Request, res: Response) => {
                 status: paymentData.status,
                 method: paymentMethod
             },
+            messaging: {
+                outboxQueue: ORDER_CONFIRMED_QUEUE,
+                deliveryMode: publishedToRabbit ? 'RABBITMQ_QUEUE' : 'HTTP_FALLBACK'
+            },
             invoice: invoiceData?.invoice || null,
             sagaSteps: sagaTrace
         });
@@ -462,5 +603,5 @@ async function compensateInventory(
 }
 
 app.listen(PORT, () => {
-    console.log(`[Order Service / Saga Orchestrator - TypeScript] Rodando na porta ${PORT} | SQLite: ${DB_PATH}`);
+    console.log(`[Order Service / Saga Orchestrator - TypeScript] Rodando na porta ${PORT} | SQLite: ${DB_PATH} | Fila Outbox: ${ORDER_CONFIRMED_QUEUE}`);
 });
