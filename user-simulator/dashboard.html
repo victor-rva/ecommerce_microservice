@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Painel Gerencial — Simulador Poliglota & Saga SQLite</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --panel: #131b2e;
+      --panel-alt: #19233c;
+      --border: #263554;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --green: #10b981;
+      --red: #ef4444;
+      --yellow: #f59e0b;
+      --purple: #a855f7;
+      --cyan: #06b6d4;
+      --blue: #3b82f6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+      padding: 16px 22px;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+      background: linear-gradient(90deg, #111827 0%, #1e293b 100%);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 16px;
+    }
+    .title-area h1 {
+      font-size: 1.35rem;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .title-area p {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-top: 3px;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.8rem;
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .status-running { background: rgba(16, 185, 129, 0.18); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
+    .status-paused { background: rgba(245, 158, 11, 0.18); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4); }
+
+    .controls-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+    button {
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--panel-alt);
+      color: var(--text);
+      padding: 8px 13px;
+      border-radius: 8px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    button:hover { filter: brightness(1.18); transform: translateY(-1px); }
+    .btn-primary { background: var(--blue); border-color: #60a5fa; color: #fff; }
+    .btn-success { background: #059669; border-color: #34d399; color: #fff; }
+    .btn-danger { background: #dc2626; border-color: #f87171; color: #fff; }
+    .btn-purple { background: #7e22ce; border-color: #c084fc; color: #fff; }
+    .btn-warning { background: #d97706; border-color: #fbbf24; color: #fff; }
+
+    /* KPIs */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .kpi-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 13px 16px;
+    }
+    .kpi-label { font-size: 0.76rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .kpi-value { font-size: 1.55rem; font-weight: 700; margin-top: 4px; }
+    .kpi-sub { font-size: 0.75rem; color: var(--muted); margin-top: 3px; }
+
+    /* Trigger Bar */
+    .scenario-bar {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 16px;
+      margin-bottom: 16px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .scenario-bar span { font-size: 0.85rem; font-weight: 600; color: #cbd5e1; }
+    .scenario-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+
+    /* Main Grid */
+    .main-grid {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    @media (max-width: 1100px) {
+      .main-grid { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .card-header h2 { font-size: 1rem; display: flex; align-items: center; gap: 8px; }
+    .badge {
+      font-size: 0.72rem;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+      background: var(--panel-alt);
+      color: var(--cyan);
+      border: 1px solid rgba(6, 182, 212, 0.3);
+    }
+
+    /* Users List */
+    .users-list {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+    .user-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 0.84rem;
+    }
+    .user-info { display: flex; align-items: center; gap: 10px; min-width: 230px; }
+    .avatar { font-size: 1.35rem; }
+    .user-name { font-weight: 600; color: #f8fafc; }
+    .user-meta { font-size: 0.73rem; color: var(--muted); }
+    .user-action { flex: 1; color: #cbd5e1; font-family: Consolas, monospace; font-size: 0.8rem; }
+    .role-tag {
+      font-size: 0.7rem;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .role-REGULAR { background: rgba(16, 185, 129, 0.15); color: #34d399; }
+    .role-ANOMALY_WHALE { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
+    .role-FRAUD_BLOCKLIST { background: rgba(239, 68, 68, 0.2); color: #f87171; }
+    .role-NO_FUNDS_789 { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+
+    /* Live Feed */
+    .events-feed {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 490px;
+      overflow-y: auto;
+    }
+    .event-item {
+      background: var(--panel-alt);
+      border-left: 4px solid var(--cyan);
+      border-radius: 6px;
+      padding: 9px 12px;
+      font-size: 0.82rem;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .event-item:hover { background: #223052; }
+    .event-SUCCESS { border-left-color: var(--green); }
+    .event-FRAUD_ID { border-left-color: var(--red); }
+    .event-FRAUD_BEHAVIOR { border-left-color: var(--purple); }
+    .event-PAYMENT_DECLINED { border-left-color: var(--yellow); }
+    .event-OUT_OF_STOCK { border-left-color: #64748b; }
+    .event-top { display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--muted); margin-bottom: 3px; }
+    .event-title { font-weight: 600; color: #f1f5f9; margin-bottom: 2px; }
+    .event-detail { font-size: 0.76rem; color: #94a3b8; }
+
+    /* Inventory & SQLite Grid */
+    .stock-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+      gap: 10px;
+    }
+    .stock-item {
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 0.8rem;
+    }
+    .stock-top { display: flex; justify-content: space-between; font-weight: 600; margin-bottom: 5px; }
+    .progress-bg { width: 100%; height: 7px; background: #0f172a; border-radius: 4px; overflow: hidden; margin: 6px 0; }
+    .progress-fill { height: 100%; background: var(--green); transition: width 0.3s ease; }
+
+    /* SQLite 8 Services Table */
+    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; font-size: 0.74rem; text-transform: uppercase; }
+    tr:hover td { background: rgba(255,255,255,0.02); }
+
+    /* Modal de Auditoria da Saga */
+    .modal-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 20px;
+    }
+    .modal {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      max-width: 780px;
+      width: 100%;
+      padding: 20px;
+      max-height: 85vh;
+      overflow-y: auto;
+    }
+    .step-box {
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      font-size: 0.82rem;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="title-area">
+      <h1>
+        🌐 Painel Gerencial — Ecossistema E-Commerce Poliglota
+        <span id="simStatusPill" class="status-pill status-running">● SIMULAÇÃO ATIVA</span>
+      </h1>
+      <p>Monitoramento ao vivo de Usuários Simultâneos, Orquestração de Saga (7 Linguagens) e 8 Bancos SQLite Isolados</p>
+    </div>
+    <div class="controls-bar">
+      <label style="font-size: 0.8rem; color: var(--muted);">
+        Usuários Simultâneos:
+        <select id="concurrencySelect" onchange="changeConcurrency()" style="background:#0f172a; color:#fff; border:1px solid var(--border); padding:5px 8px; border-radius:6px;">
+          <option value="2">2 Bots</option>
+          <option value="5" selected>5 Bots</option>
+          <option value="8">8 Bots</option>
+          <option value="10">10 Bots (Alta Carga)</option>
+        </select>
+      </label>
+      <button id="toggleBtn" class="btn-primary" onclick="toggleSimulation()">⏸ Pausar Simulação</button>
+      <button onclick="seedDatabase(false)">🌱 Reabastecer Estoque SQLite</button>
+      <button onclick="seedDatabase(true)">🔄 Resetar Todos os 8 SQLites</button>
+    </div>
+  </header>
+
+  <!-- KPIs Globais -->
+  <div class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpi-label">✅ Pedidos Aprovados (Saga 7/7)</div>
+      <div class="kpi-value" style="color: var(--green);" id="kpiApproved">0</div>
+      <div class="kpi-sub" id="kpiRevenue">Receita: R$ 0,00</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">🛡️ Fraude Blocklist (IDs 123, 456)</div>
+      <div class="kpi-value" style="color: var(--red);" id="kpiFraudId">0</div>
+      <div class="kpi-sub">Barrados no Rust + Rollback Python</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">🚨 Fraude Comportamental (Valor/Vol)</div>
+      <div class="kpi-value" style="color: var(--purple);" id="kpiFraudBehavior">0</div>
+      <div class="kpi-sub">Pego por Heurística (&ge; R$ 50k / Lote)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">💳 Cartão Sem Saldo (ID 789)</div>
+      <div class="kpi-value" style="color: var(--yellow);" id="kpiDeclined">0</div>
+      <div class="kpi-sub">Recusado no Java 17 + Rollback Estoque</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">🔄 Compensações da Saga (Rollbacks)</div>
+      <div class="kpi-value" style="color: var(--cyan);" id="kpiRollbacks">0</div>
+      <div class="kpi-sub">Reservas devolvidas ao SQLite</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">⚡ Latência Média End-to-End</div>
+      <div class="kpi-value" id="kpiLatency">0 ms</div>
+      <div class="kpi-sub" id="kpiTotalReq">Total de Checkouts: 0</div>
+    </div>
+  </div>
+
+  <!-- Barra de Disparo Manual de Cenários -->
+  <div class="scenario-bar">
+    <span>🎯 Testar Cenário Específico Agora (Disparo Instantâneo):</span>
+    <div class="scenario-buttons">
+      <button class="btn-success" onclick="triggerScenario('HAPPY')">🛒 Compra Aprovada (Happy Path)</button>
+      <button class="btn-danger" onclick="triggerScenario('FRAUD_123')">🕵️‍♂️ Simular Fraude (UserID 123)</button>
+      <button class="btn-danger" onclick="triggerScenario('FRAUD_456')">🤖 Simular Bot Fraude (UserID 456)</button>
+      <button class="btn-purple" onclick="triggerScenario('FRAUD_BEHAVIOR')">🐳 Fraude por Valor/Anomalia (Sem ID sujo!)</button>
+      <button class="btn-warning" onclick="triggerScenario('DECLINED_789')">💳 Cartão Sem Saldo (UserID 789)</button>
+      <button onclick="triggerScenario('OUT_OF_STOCK')">📦 Forçar Falta de Estoque (HTTP 409)</button>
+    </div>
+  </div>
+
+  <!-- Grid Principal: Usuários Simultâneos + Eventos da Saga -->
+  <div class="main-grid">
+    <div class="card">
+      <div class="card-header">
+        <h2>👥 Usuários Simulados Acessando Agora</h2>
+        <span class="badge">Concorrência Multi-Thread</span>
+      </div>
+      <div id="usersContainer" class="users-list"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h2>📜 Feed da Saga em Tempo Real (Clique para ver Trilha)</h2>
+        <span id="feedBadge" class="badge">Go • TS • Clojure • Python • Rust • Java</span>
+      </div>
+      <div id="eventsContainer" class="events-feed"></div>
+    </div>
+  </div>
+
+  <!-- Grid Secundário: Estoque em Tempo Real + 8 Bancos SQLite -->
+  <div class="main-grid">
+    <div class="card">
+      <div class="card-header">
+        <h2>📦 Estoque em Tempo Real (inventory.db — Python :3004)</h2>
+        <span class="badge">Reserva em 2 Fases & Compensação</span>
+      </div>
+      <div id="inventoryContainer" class="stock-grid"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h2>🗄️ Persistência Poliglota — 8 Bancos SQLite Isolados</h2>
+        <span class="badge">Database-per-Service</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Microsserviço</th>
+            <th>Linguagem</th>
+            <th>Arquivo SQLite</th>
+            <th>Tabela Principal</th>
+            <th>Registros Gravados</th>
+          </tr>
+        </thead>
+        <tbody id="sqliteTableBody"></tbody>
+      </table>
+
+      <div style="margin-top: 14px; padding: 10px 12px; background: var(--panel-alt); border-radius: 8px; border: 1px solid var(--border); font-size: 0.78rem; color: var(--muted);">
+        💡 <strong>Como o Rust identifica Fraude?</strong><br/>
+        1. <strong>Blocklist Determinística (IDs 123 e 456):</strong> Representa contas/CPFs com histórico de chargeback.<br/>
+        2. <strong>Heurística Comportamental (Qualquer Usuário):</strong> O motor em Rust soma pontos se o ticket for alto (&ge; R$ 25k = +40 pts, &ge; R$ 50k = +85 pts) ou quantidade em lote (&ge; 15 itens = +45 pts). Se o score atingir <strong>&ge; 80</strong>, bloqueia mesmo um cliente legítimo!
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal de Inspeção de Trilha da Saga -->
+  <div id="traceModal" class="modal-backdrop" onclick="closeModal(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <h3 id="modalTitle">Trilha Completa da Saga</h3>
+        <button onclick="document.getElementById('traceModal').style.display='none'">✖ Fechar</button>
+      </div>
+      <div id="modalContent">Carregando...</div>
+    </div>
+  </div>
+
+  <script>
+    let currentRunning = true;
+    let isHoveringFeed = false;
+    let lastEventsSignature = '';
+    let lastDashboardData = null;
+
+    function formatBRL(v) {
+      return Number(v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+    }
+
+    async function fetchDashboardState(forceRenderFeed = false) {
+      try {
+        const res = await fetch('/api/state');
+        const data = await res.json();
+        lastDashboardData = data;
+        renderDashboard(data, forceRenderFeed);
+      } catch (e) {
+        console.error('Erro ao buscar estado:', e);
+      }
+    }
+
+    function renderDashboard(data, forceRenderFeed = false) {
+      currentRunning = data.running;
+      const pill = document.getElementById('simStatusPill');
+      const toggleBtn = document.getElementById('toggleBtn');
+      if (data.running) {
+        pill.className = 'status-pill status-running';
+        pill.textContent = '● SIMULAÇÃO ATIVA';
+        toggleBtn.textContent = '⏸ Pausar Simulação';
+      } else {
+        pill.className = 'status-pill status-paused';
+        pill.textContent = '⏸ SIMULAÇÃO PAUSADA';
+        toggleBtn.textContent = '▶ Retomar Simulação';
+      }
+
+      const m = data.metrics;
+      document.getElementById('kpiApproved').textContent = m.approved_orders;
+      document.getElementById('kpiRevenue').textContent = 'Receita: ' + formatBRL(m.total_revenue);
+      document.getElementById('kpiFraudId').textContent = m.fraud_blocklist_rejected;
+      document.getElementById('kpiFraudBehavior').textContent = m.fraud_behavior_rejected;
+      document.getElementById('kpiDeclined').textContent = m.payment_declined_789;
+      document.getElementById('kpiRollbacks').textContent = m.saga_rollbacks;
+      document.getElementById('kpiLatency').textContent = m.avg_latency_ms + ' ms';
+      document.getElementById('kpiTotalReq').textContent = 'Total de Checkouts: ' + m.total_requests;
+
+      // Renderiza Usuários
+      const usersHtml = data.virtualUsers.map(u => {
+        const roleLabels = {
+          'REGULAR': 'Cliente Regular',
+          'ANOMALY_WHALE': 'Anomalia Valor/Volume',
+          'FRAUD_BLOCKLIST': 'Blocklist Fraude',
+          'NO_FUNDS_789': 'Cartão Sem Saldo'
+        };
+        return `
+          <div class="user-row">
+            <div class="user-info">
+              <span class="avatar">${u.avatar}</span>
+              <div>
+                <div class="user-name">${u.name} <span style="color:var(--muted); font-size:0.75rem;">(ID #${u.user_id})</span></div>
+                <div class="user-meta">UF: ${u.state} • Pedidos: ${u.orders_count}</div>
+              </div>
+            </div>
+            <div class="user-action">${u.current_action}</div>
+            <span class="role-tag role-${u.role}">${roleLabels[u.role] || u.role}</span>
+          </div>
+        `;
+      }).join('');
+      document.getElementById('usersContainer').innerHTML = usersHtml;
+
+      // Renderiza Feed de Eventos (preservando os nós DOM se não houve mudança ou enquanto o mouse estiver sobre a lista para não cancelar o clique)
+      const eventsList = (data.recentEvents && data.recentEvents.length > 0)
+        ? data.recentEvents
+        : (data.recentOrders || []).map(o => ({
+            timestamp: String(o.createdAt || '').slice(11, 19) || data.serverTime,
+            kind: o.status === 'CONFIRMED' ? 'SUCCESS' : (o.status === 'CANCELLED_FRAUD_DETECTED' ? 'FRAUD_ID' : (o.status === 'CANCELLED_PAYMENT_DECLINED' ? 'PAYMENT_DECLINED' : 'OUT_OF_STOCK')),
+            badge: o.status === 'CONFIRMED' ? '✅ SAGA COMPLETA' : `🔄 ${o.status}`,
+            userId: o.userId,
+            userName: `Cliente #${o.userId}`,
+            avatar: '🛒',
+            orderId: o.orderId,
+            title: `Pedido #${o.orderId} — ${o.quantity}x ${o.productName}`,
+            detail: `Total: ${formatBRL(o.totalPrice)} • Status: ${o.status} (Clique para inspecionar trilha)`,
+            latencyMs: m.avg_latency_ms || 45
+          }));
+
+      const newSig = eventsList.map(ev => `${ev.orderId}-${ev.timestamp}-${ev.kind}`).join('|');
+      const eventsContainer = document.getElementById('eventsContainer');
+
+      if (forceRenderFeed || !eventsContainer.innerHTML || (!isHoveringFeed && newSig !== lastEventsSignature)) {
+        lastEventsSignature = newSig;
+        const eventsHtml = eventsList.map(ev => `
+          <div class="event-item event-${ev.kind}" data-order-id="${ev.orderId || ''}" data-user-id="${ev.userId || ''}">
+            <div class="event-top">
+              <span><strong>${ev.badge}</strong> • ${ev.avatar} ${ev.userName} (ID #${ev.userId})</span>
+              <span style="display:inline-flex; align-items:center; gap:8px;">
+                <span>${ev.timestamp} • ${ev.latencyMs}ms</span>
+                ${ev.orderId ? `<span style="background:rgba(6,182,212,0.18); color:#22d3ee; border:1px solid rgba(6,182,212,0.4); padding:1px 7px; border-radius:4px; font-weight:600; font-size:0.72rem;">🔍 Ver Trilha #${ev.orderId}</span>` : ''}
+              </span>
+            </div>
+            <div class="event-title">${ev.title}</div>
+            <div class="event-detail">${ev.detail}</div>
+          </div>
+        `).join('');
+        eventsContainer.innerHTML = eventsHtml || '<div style="color:var(--muted);">Aguardando primeiros eventos...</div>';
+      }
+
+      // Renderiza Estoque
+      const invHtml = data.inventory.map(item => {
+        const pct = Math.min(100, Math.round((item.available_qty / 40) * 100));
+        let color = 'var(--green)';
+        if (item.available_qty === 0) color = 'var(--red)';
+        else if (item.available_qty <= item.reorder_threshold) color = 'var(--yellow)';
+
+        return `
+          <div class="stock-item">
+            <div class="stock-top">
+              <span>#${item.product_id} ${item.product_name}</span>
+            </div>
+            <div class="progress-bg">
+              <div class="progress-fill" style="width:${pct}%; background:${color};"></div>
+            </div>
+            <div style="display:flex; justify-content:space-between; color:var(--muted); font-size:0.75rem;">
+              <span>Disp: <strong style="color:${color}">${item.available_qty}</strong></span>
+              <span>Reservado: <strong>${item.reserved_qty}</strong></span>
+              <span>Min: ${item.reorder_threshold}</span>
+            </div>
+          </div>
+        `;
+      }).join('');
+      document.getElementById('inventoryContainer').innerHTML = invHtml;
+
+      // Renderiza Tabela dos 8 Bancos SQLite
+      const sqliteHtml = data.sqliteDatabases.map(db => `
+        <tr>
+          <td><strong>${db.service}</strong> <span style="color:var(--muted)">(:${db.port})</span></td>
+          <td><span class="badge">${db.lang}</span></td>
+          <td style="font-family:Consolas,monospace; color:#cbd5e1;">${db.db}</td>
+          <td>${db.table}</td>
+          <td><strong style="color:var(--green); font-size:0.95rem;">${db.rows}</strong> ${db.extra !== undefined ? `<span style="color:var(--muted)">(+${db.extra} logs)</span>` : ''}</td>
+        </tr>
+      `).join('');
+      document.getElementById('sqliteTableBody').innerHTML = sqliteHtml;
+    }
+
+    async function toggleSimulation() {
+      await fetch('/api/control/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ running: !currentRunning })
+      });
+      fetchDashboardState(true);
+    }
+
+    async function changeConcurrency() {
+      const val = Number(document.getElementById('concurrencySelect').value);
+      await fetch('/api/control/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ running: currentRunning, concurrency: val })
+      });
+      fetchDashboardState(true);
+    }
+
+    async function seedDatabase(reset) {
+      await fetch('/api/control/seed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reset })
+      });
+      lastEventsSignature = '';
+      fetchDashboardState(true);
+    }
+
+    async function triggerScenario(scenario) {
+      await fetch('/api/control/trigger', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scenario })
+      });
+      fetchDashboardState(true);
+    }
+
+    async function inspectOrder(orderId) {
+      if (!orderId) return;
+      const modal = document.getElementById('traceModal');
+      const content = document.getElementById('modalContent');
+      document.getElementById('modalTitle').textContent = `🔍 Auditoria da Saga — Pedido #${orderId} (orders.db -> saga_logs)`;
+      content.innerHTML = 'Consultando trilha da Saga em orders.db...';
+      modal.style.display = 'flex';
+
+      try {
+        const res = await fetch(`/api/order-trace/${orderId}`);
+        const data = await res.json();
+        if (!data.sagaExecutionTrace || data.sagaExecutionTrace.length === 0) {
+          content.innerHTML = `<pre style="color:#94a3b8;">${JSON.stringify(data, null, 2)}</pre>`;
+          return;
+        }
+
+        const ord = data.order || {};
+        const summaryHtml = `
+          <div style="background:#0f172a; border:1px solid var(--border); border-radius:8px; padding:10px 14px; margin-bottom:12px; font-size:0.8rem; display:flex; flex-wrap:wrap; gap:14px; justify-content:space-between;">
+            <div><strong>Pedido:</strong> #${ord.orderId || orderId}</div>
+            <div><strong>Cliente ID:</strong> #${ord.userId || '-'} (${ord.stateCode || 'SP'})</div>
+            <div><strong>Produto:</strong> ${ord.quantity || 1}x ${ord.productName || '-'}</div>
+            <div><strong>Valor Final:</strong> ${formatBRL(ord.totalPrice)}</div>
+            <div><strong>Status Final:</strong> <span style="color:var(--cyan); font-weight:700;">${ord.status || '-'}</span></div>
+          </div>
+        `;
+
+        const stepsHtml = data.sagaExecutionTrace.map(s => {
+          let border = 'var(--green)';
+          if (s.status === 'FAILED') border = 'var(--red)';
+          if (s.status === 'COMPENSATED') border = 'var(--yellow)';
+          return `
+            <div class="step-box" style="border-left: 4px solid ${border};">
+              <div style="display:flex; justify-content:space-between; font-weight:600;">
+                <span>Passo ${s.stepOrder}: ${s.action} — ${s.serviceName} (${s.language})</span>
+                <span style="color:${border}">${s.status}</span>
+              </div>
+              <pre style="margin-top:6px; font-size:0.74rem; color:#94a3b8; overflow-x:auto;">${JSON.stringify(s.details, null, 2)}</pre>
+            </div>
+          `;
+        }).join('');
+
+        content.innerHTML = summaryHtml + stepsHtml;
+      } catch (err) {
+        content.innerHTML = 'Erro ao carregar trilha do pedido.';
+      }
+    }
+
+    function closeModal(e) {
+      if (e.target.id === 'traceModal') {
+        document.getElementById('traceModal').style.display = 'none';
+      }
+    }
+
+    // Delegação de eventos e trava de hover no Feed para cliques 100% confiáveis
+    const feedEl = document.getElementById('eventsContainer');
+    const feedBadge = document.getElementById('feedBadge');
+
+    feedEl.addEventListener('mouseenter', () => {
+      isHoveringFeed = true;
+      feedBadge.textContent = '⏸ Feed fixado p/ clique • Clique num item';
+      feedBadge.style.color = '#fbbf24';
+    });
+
+    feedEl.addEventListener('mouseleave', () => {
+      isHoveringFeed = false;
+      feedBadge.textContent = 'Go • TS • Clojure • Python • Rust • Java';
+      feedBadge.style.color = 'var(--cyan)';
+      if (lastDashboardData) {
+        renderDashboard(lastDashboardData, true);
+      }
+    });
+
+    feedEl.addEventListener('click', (e) => {
+      const item = e.target.closest('.event-item');
+      if (!item) return;
+      let orderId = item.getAttribute('data-order-id');
+      if (!orderId && lastDashboardData && lastDashboardData.recentOrders && lastDashboardData.recentOrders.length > 0) {
+        const uid = Number(item.getAttribute('data-user-id'));
+        const matched = lastDashboardData.recentOrders.find(o => Number(o.userId) === uid) || lastDashboardData.recentOrders[0];
+        if (matched) orderId = matched.orderId;
+      }
+      if (orderId) {
+        inspectOrder(orderId);
+      }
+    });
+
+    setInterval(() => fetchDashboardState(false), 1000);
+    fetchDashboardState(true);
+  </script>
+</body>
+</html>
