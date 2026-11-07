@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+**/node_modules/
+.lib/
+**/.lib/
+
+# Build & Runtime Artifacts
+dist/
+**/dist/
+build/
+**/build/
+target/
+**/target/
+.gradle/
+**/.gradle/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.class
+*.jar
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Isolated SQLite Databases (Database-per-Service)
+data/
+**/data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Environment & OS
+.env
+.env.*
+.DS_Store
+Thumbs.db
+*.log
