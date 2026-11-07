@@ -1,6 +1,6 @@
 import path from 'path';
 import fs from 'fs';
-import { execFileSync, spawn, ChildProcessWithoutNullStreams } from 'child_process';
+import { execFileSync, spawn, ChildProcess } from 'child_process';
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 if (!fs.existsSync(DATA_DIR)) {
@@ -11,7 +11,7 @@ export const DB_PATH = process.env.SQLITE_DB_PATH || path.join(DATA_DIR, 'orders
 
 class SqliteBridge {
     private nativeDb: any = null;
-    private pyWorker: ChildProcessWithoutNullStreams | null = null;
+    private pyWorker: ChildProcess | null = null;
     private ordersMap: Map<number, any> = new Map();
     private sagaLogsMap: Map<number, any[]> = new Map();
     private outboxMap: Map<number, any[]> = new Map();
@@ -51,10 +51,11 @@ for line in sys.stdin:
         pass
 `;
         try {
-            this.pyWorker = spawn('python', ['-u', '-c', workerScript, this.dbPath], {
+            const worker = spawn('python', ['-u', '-c', workerScript, this.dbPath], {
                 stdio: ['pipe', 'ignore', 'ignore']
             });
-            this.pyWorker.on('exit', () => {
+            this.pyWorker = worker;
+            worker.on('exit', () => {
                 this.pyWorker = null;
                 setTimeout(() => this.startPersistentWorker(), 500);
             });
@@ -64,7 +65,7 @@ for line in sys.stdin:
     }
 
     private enqueueWrite(sql: string, params: any[] = []): void {
-        if (this.pyWorker && this.pyWorker.stdin.writable) {
+        if (this.pyWorker && this.pyWorker.stdin && this.pyWorker.stdin.writable) {
             this.pyWorker.stdin.write(JSON.stringify({ sql, params }) + '\n');
             return;
         }
@@ -244,7 +245,8 @@ conn.close()
         }
 
         if (normalized.startsWith('INSERT INTO OUTBOX_EVENTS')) {
-            const [aggregateId, payload, createdAt] = params;
+            const [aggregateId, payload, published, createdAt] =
+                params.length === 4 ? params : [params[0], params[1], 1, params[2]];
             const aid = Number(aggregateId);
             const list = this.outboxMap.get(aid) || [];
             list.push({
@@ -252,10 +254,21 @@ conn.close()
                 aggregateId: aid,
                 eventType: 'OrderConfirmedEvent',
                 payload,
-                published: 1,
+                published: Number(published),
                 createdAt
             });
             this.outboxMap.set(aid, list);
+            this.enqueueWrite(sql, params);
+            return [];
+        }
+
+        if (normalized.startsWith('UPDATE OUTBOX_EVENTS SET PUBLISHED =')) {
+            const [published, aggregateId] = params;
+            const aid = Number(aggregateId);
+            const list = this.outboxMap.get(aid) || [];
+            for (const ev of list) {
+                ev.published = Number(published);
+            }
             this.enqueueWrite(sql, params);
             return [];
         }
@@ -292,6 +305,17 @@ conn.close()
                 const memOutbox = this.outboxMap.get(aid);
                 if (memOutbox) return memOutbox;
                 return this.execSqlSyncFallback(sql, params);
+            }
+            if (normalized.includes('FROM OUTBOX_EVENTS WHERE PUBLISHED = 0')) {
+                const pending: any[] = [];
+                for (const list of this.outboxMap.values()) {
+                    for (const ev of list) {
+                        if (Number(ev.published) === 0) {
+                            pending.push(ev);
+                        }
+                    }
+                }
+                return pending;
             }
         }
 
