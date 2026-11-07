@@ -1,6 +1,6 @@
 # Polyglot E-Commerce Microservices — Distributed Architecture & Paradigm Sandbox
 
-> **Um laboratório prático de Engenharia de Software para explorar Sistemas Distribuídos, Consistência Eventual (Saga Pattern), Persistência Poliglota Isolada e o contraste real entre 7 linguagens de programação e múltiplos paradigmas.**
+> **Um laboratório prático de Engenharia de Software para explorar Sistemas Distribuídos, Consistência Eventual (Saga Pattern), Transactional Outbox com RabbitMQ, Persistência Poliglota Isolada e o contraste real entre múltiplas linguagens de programação e paradigmas.**
 
 ---
 
@@ -18,22 +18,25 @@ Este projeto nasceu como um **Sandbox Arquitetural Intencionalmente *Over-Engine
 
 ## 2. Desenho da Arquitetura
 
-O ecossistema é composto por **8 microsserviços independentes**, escritos em **6 linguagens distintas** (após a substituição de segurança do PHP por Go no `notification-service`), onde **cada serviço possui seu próprio banco de dados SQLite isolado** (*Database-per-Service Pattern*).
+O ecossistema é composto por **8 microsserviços independentes**, um **Message Broker (RabbitMQ)** e um **Simulador de Tráfego & Painel Gerencial Web**, escritos em **6 linguagens distintas** (após a substituição de segurança do PHP por Go no `notification-service`), onde **cada serviço possui seu próprio banco de dados SQLite isolado** (*Database-per-Service Pattern*).
 
 ```mermaid
 flowchart TD
-    Client["Cliente / API Consumer"] -->|HTTP :3000| Gateway["api-gateway (Go)\nReverse Proxy, Rate Limiter & Tracing\nSQLite: gateway.db"]
+    Sim["user-simulator (Python :3080)\nPainel Gerencial Web & Simulador de Tráfego\nSQLite: simulator.db"] -->|HTTP :3000| Gateway["api-gateway (Go)\nReverse Proxy, Rate Limiter & Tracing\nSQLite: gateway.db"]
+    Client["Cliente / API Consumer"] -->|HTTP :3000| Gateway
 
-    subgraph DomainServices ["Camada de Domínio & Orquestração de Saga"]
+    subgraph DomainServices ["Camada de Domínio, Orquestração de Saga & Mensageria"]
         Gateway -->|/api/products| Product["product-service (TypeScript)\nCatálogo & SKUs\nPorta :3001 | SQLite: products.db"]
-        Gateway -->|/api/orders| Order["order-service (TypeScript)\nSaga Orchestrator & Outbox\nPorta :3002 | SQLite: orders.db"]
+        Gateway -->|/api/orders| Order["order-service (TypeScript)\nSaga Orchestrator & Outbox Relay\nPorta :3002 | SQLite: orders.db"]
 
         Order -->|1. Valida Catálogo| Product
         Order -->|2. Pipeline Imutável de Preço/Cupom| Pricing["pricing-service (Clojure)\nMotor Funcional de Precificação\nPorta :3003 | SQLite: pricing.db"]
         Order -->|3. Reserva em 2 Fases / Rollback| Inventory["inventory-service (Python)\nControle Transacional de Estoque\nPorta :3004 | SQLite: inventory.db"]
         Order -->|4. Score de Risco & Pattern Matching| Fraud["fraud-service (Rust)\nMotor Nativo de Antifraude\nPorta :3005 | SQLite: fraud.db"]
         Order -->|5. Cobrança Idempotente & Ledger| Payment["payment-service (Java 17)\nProcessamento Financeiro\nPorta :3006 | SQLite: payments.db"]
-        Order -->|6. Pós-Venda / Emissão de NF-e| Notification["notification-service (Go)\nFaturamento SEFAZ & Notificações\nPorta :3007 | SQLite: notifications.db"]
+        Order -->|6a. Publica Outbox Event| Rabbit["RabbitMQ (:5672 / :15672)\nFila Durável: order.confirmed"]
+        Rabbit -->|6b. Consome Fila| Notification["notification-service (Go)\nFaturamento SEFAZ & Notificações\nPorta :3007 | SQLite: notifications.db"]
+        Order -.->|6c. Fallback HTTP se RabbitMQ offline| Notification
     end
 ```
 
@@ -41,15 +44,15 @@ flowchart TD
 
 ## 3. Padrões de Engenharia e Sistemas Distribuídos Aplicados
 
-### 3.1. Database-per-Service com Isolamento Estrito (8 instâncias SQLite)
+### 3.1. Database-per-Service com Isolamento Estrito (Bancos SQLite Isolados)
 Um dos anti-padrões mais comuns na migração para microsserviços é o *"Monolito Distribuído"*, onde vários serviços continuam fazendo `JOIN` nas mesmas tabelas de um banco centralizado.
 
-Neste projeto, **nenhum serviço enxerga o banco de dados do outro**:
+Neste projeto, **nenhum serviço de domínio enxerga o banco de dados do outro**:
 - Cada microsserviço gerencia exclusivamente seu arquivo `.db` local (`gateway.db`, `products.db`, `orders.db`, `pricing.db`, `inventory.db`, `fraud.db`, `payments.db`, `notifications.db`).
-- A escolha do **SQLite (em modo WAL - *Write-Ahead Logging*)** para cada nó permite ter **8 bancos relacionais reais e transacionais (ACID)** rodando simultaneamente com consumo mínimo de memória, facilitando a inspeção individual de schemas, índices e registros gerados em cada etapa.
+- A escolha do **SQLite (em modo WAL - *Write-Ahead Logging*)** para cada nó permite ter **bancos relacionais reais e transacionais (ACID)** rodando simultaneamente com consumo mínimo de memória, facilitando a inspeção individual de schemas, índices e registros gerados em cada etapa.
 
 ### 3.2. Padrão Saga Orquestrado & Transações de Compensação
-Em um ambiente distribuído, não é viável abrir uma transação SQL global (`BEGIN ... COMMIT`) que atravesse Node.js, Clojure, Python, Rust e Java simultaneamente. Para resolver isso, o `order-service` implementa o **Saga Execution Coordinator (SEC)**:
+Em um ambiente distribuído, não é viável abrir uma transação SQL global (`BEGIN ... COMMIT`) que atravesse Node.js, Clojure, Python, Rust, Java e Go simultaneamente. Para resolver isso, o `order-service` implementa o **Saga Execution Coordinator (SEC)**:
 
 ```mermaid
 sequenceDiagram
@@ -61,6 +64,7 @@ sequenceDiagram
     participant IS as Inventory (Python)
     participant FS as Fraud Engine (Rust)
     participant PAY as Payment Ledger (Java 17)
+    participant RMQ as RabbitMQ (order.confirmed)
     participant NF as Invoicing (Go)
 
     GW->>OS: POST /orders (X-Correlation-ID)
@@ -82,8 +86,9 @@ sequenceDiagram
         else Pagamento Aprovado
             PAY-->>OS: 201 Created (transactionId + Ledger Entries)
             OS->>IS: 6. POST /inventory/confirm (Baixa definitiva do estoque)
-            OS->>NF: 7. Emite Nota Fiscal (Chave 44 dígitos) & Dispara Notificação
-            OS-->>GW: 201 Created (Trilha completa da Saga)
+            OS->>RMQ: 7. Outbox Event -> Publica na fila 'order.confirmed' (ou Fallback HTTP)
+            RMQ->>NF: Consome fila -> Emite NF-e (Chave 44 dígitos SEFAZ) & Notificação
+            OS-->>GW: 201 Created (Trilha completa da Saga + NF-e)
         end
     end
 ```
@@ -97,9 +102,15 @@ Para evitar *overselling* (vender o mesmo item para dois clientes concorrentes e
 ### 3.4. Idempotência Financeira e Livro-Razão (*Double-Entry Bookkeeping*)
 No `payment-service` (Java 17), cada cobrança recebe uma chave determinística (`idempotency_key`) vinculada ao pedido e ao `X-Correlation-ID`. Além do registro do pagamento, o serviço aplica o princípio contábil de **Partidas Dobradas** na tabela `ledger_entries`: cada centavo cobrado gera simultaneamente um lançamento de **DÉBITO (`DEBIT`)** na conta de recebíveis do cliente e um lançamento de **CRÉDITO (`CREDIT`)** na conta de liquidação da plataforma.
 
+### 3.5. Transactional Outbox Pattern + Fila RabbitMQ (`order.confirmed`) com Fallback HTTP
+No Passo 7 da Saga, para evitar perda de eventos de faturamento após a confirmação financeira:
+1. O `order-service` grava o evento `OrderConfirmedEvent` na tabela local `outbox_events` (`orders.db`) com `published = 0`.
+2. **Com RabbitMQ ativo (Docker)**: O evento é publicado na fila durável **`order.confirmed`** do RabbitMQ e marcado como `published = 1`. O `notification-service` (Go) possui uma goroutine consumidora dedicada que lê a fila `order.confirmed`, emite a NF-e de forma **idempotente** por `order_id` e registra os disparos em `notifications.db`.
+3. **Fallback HTTP Automático (Execução local `.ps1` sem Docker)**: Caso o RabbitMQ não esteja rodando localmente, o `order-service` realiza o fallback transparente via `POST /notifications/order-confirmed` diretamente para o serviço em Go e conta com um worker *Outbox Relay* em background a cada 5 segundos para reprocessar eventuais mensagens pendentes (`published = 0`).
+
 ---
 
-## 4. Por que 7 Linguagens? A Engenharia por trás de cada Escolha
+## 4. A Engenharia por trás de cada Escolha de Linguagem
 
 A seleção das linguagens não foi aleatória. Cada serviço foi projetado para demonstrar como as características intrínsecas de uma linguagem, seu sistema de tipos e seu *runtime* resolvem um problema específico de engenharia:
 
@@ -108,19 +119,19 @@ A seleção das linguagens não foi aleatória. Cada serviço foi projetado para
 - **Por que Go?** Go foi desenhado no Google exatamente para infraestrutura de rede e proxies (como Traefik, Docker e Kubernetes). Suas *goroutines* com *channels* e `sync.WaitGroup` permitem consultar a saúde dos 7 microsserviços downstream **em paralelo** em poucos milissegundos, com um binário estático que consome menos de 15 MB de RAM.
 
 ### 2. TypeScript / Node.js (`product-service` `:3001` & `order-service` `:3002`)
-- **Problema de Domínio**: Exposição ágil de catálogo JSON e **Orquestração de I/O da Saga** (coordenar múltiplas chamadas HTTP/eventos encadeados).
+- **Problema de Domínio**: Exposição ágil de catálogo JSON e **Orquestração de I/O da Saga** (coordenar múltiplas chamadas HTTP e publicação Outbox no RabbitMQ).
 - **Por que TypeScript?** O modelo de *Event Loop* single-threaded não-bloqueante do Node.js é excelente para serviços *I/O-bound* que passam 95% do tempo aguardando respostas de rede de outros microsserviços, enquanto o sistema de tipos estrutural do TypeScript modela contratos JSON complexos com produtividade máxima.
 
 ### 3. Clojure (`pricing-service` — Porta `3003`)
 - **Problema de Domínio**: Motor de cálculo de preços dinâmicos, descontos progressivos por volume (*Tiered Pricing*), aplicação de cupons com teto máximo e cálculo de alíquotas fiscais por estado (`SP`, `RJ`, `MG`, etc.).
 - **Por que Clojure (Funcional / Lisp na JVM)?** Motores de regras financeiras e promocionais costumam sofrer com bugs graves causados por mutação acidental de estado (*side-effects*). Em Clojure, **todas as estruturas de dados são nativamente imutáveis**. O cálculo de preço é modelado como um *pipeline* matemático puro utilizando a *threading macro* (`->`), onde o mapa da cotação atravessa funções puras (`apply-volume-tier-discount` -> `apply-coupon-rule` -> `apply-regional-tax` -> `finalize-immutable-quote`), garantindo previsibilidade total e facilidade de teste.
 
-### 4. Python 3.11 (`inventory-service` — Porta `3004`)
-- **Problema de Domínio**: Gestão de saldo físico vs. saldo reservado, transações de compensação e indicadores preditivos de ponto de ressuprimento (*reorder threshold*).
-- **Por que Python?** A clareza sintática do Python aliada à manipulação nativa de dados e ao suporte embutido ao SQLite permite expressar regras de negócio de logística e análise de estoque com código limpo, legível e de rápida manutenção.
+### 4. Python 3.11 (`inventory-service` `:3004` & `user-simulator` `:3080`)
+- **Problema de Domínio**: Gestão de saldo físico vs. saldo reservado, transações de compensação, indicadores de ponto de ressuprimento (*reorder threshold*) e simulação concorrente de usuários com painel analítico em tempo real.
+- **Por que Python?** A clareza sintática do Python aliada à manipulação nativa de dados e ao suporte embutido ao SQLite permite expressar regras de negócio de logística, análise de estoque e automação de carga com código limpo, legível e de rápida manutenção.
 
 ### 5. Rust (`fraud-service` — Porta `3005`)
-- **Problema de Domínio**: Análise de risco e detecção de anomalias de fraude em tempo real antes de autorizar a transação financeira.
+- **Problema de Domínio**: Análise de risco e detecção de anomalias de fraude em tempo real (Blocklist + Heurística Comportamental de Valor/Volume) antes de autorizar a transação financeira.
 - **Por que Rust?** Substituindo abordagens pesadas baseadas em máquina virtual, o **Rust** traz dois pilares valiosos para este estudo:
   1. **Modelagem Algébrica Funcional**: Uso de `enum Verdict { Approved, ManualReview, Rejected }` e `enum RiskSignal`, combinados com **Pattern Matching exaustivo (`match`)** verificado em tempo de compilação e iteradores funcionais (`.iter().map().fold()`).
   2. **Systems Programming & Ownership (Zero Garbage Collector)**: Compila diretamente para código de máquina nativo, garantindo segurança de memória e ausência de *data races* sem pausas de *Garbage Collection*, entregando latência previsível na casa de microssegundos.
@@ -130,40 +141,68 @@ A seleção das linguagens não foi aleatória. Cada serviço foi projetado para
 - **Por que Java 17?** Java permanece o padrão ouro de bancos, adquirentes e fintechs pela maturidade da JVM, tipagem nominal forte, concorrência robusta e evolução moderna da linguagem (como `record` para objetos de transferência imutáveis).
 
 ### 7. Go (`notification-service` — Porta `3007` | *Substituto de Segurança do PHP*)
-- **Problema de Domínio**: Geração de documentos fiscais pós-venda (simulação de Nota Fiscal Eletrônica com cálculo real de dígito verificador Módulo 11 na chave de acesso de 44 dígitos no padrão SEFAZ) e registro de disparos de e-mail/webhook.
-- **Por que migrar de PHP para Go?** Devido a falhas críticas de segurança afetando todas as versões do runtime PHP, o serviço foi integralmente reescrito em **Go (Golang)** — evitando também qualquer dependência de `node_modules` (Node.js/TypeScript). A compilação estática em Go elimina o interpretador CGI/Zend Engine, aplica limites estritos de leitura de payload (`http.MaxBytesReader`) e mantém zero dependências externas.
+- **Problema de Domínio**: Consumo assíncrono da fila `order.confirmed` no RabbitMQ (com fallback HTTP), geração de documentos fiscais pós-venda (simulação de Nota Fiscal Eletrônica com cálculo real de dígito verificador Módulo 11 na chave de acesso de 44 dígitos no padrão SEFAZ) e registro idempotente de disparos de e-mail/webhook.
+- **Por que migrar de PHP para Go?** Devido a falhas críticas de segurança afetando todas as versões do runtime PHP, o serviço foi integralmente reescrito em **Go (Golang)**. A compilação estática em Go elimina o interpretador CGI/Zend Engine, aplica limites estritos de leitura de payload (`http.MaxBytesReader`) e mantém zero dependências externas.
 
 ---
 
-## 5. Matriz Comparativa de Paradigmas e Trade-offs
+## 5. Matriz Comparativa de Paradigmas e Serviços
 
-| Microsserviço | Linguagem | Paradigma Principal | Runtime / Compilação | Modelo de Concorrência | Destaque Técnico no Código |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **`api-gateway`** | **Go** | Imperativo / Concorrente (CSP) | Nativo Compilado (Com GC leve) | Goroutines (`M:N` scheduler) + `WaitGroup` | Health-check distribuído paralelo e Reverse Proxy |
-| **`product-service`** | **TypeScript** | Multi-paradigma / Assíncrono | V8 Engine (JIT) | Event-Loop Single-Thread (`async`/`await`) | Catálogo REST desacoplado com SQLite WAL |
-| **`order-service`** | **TypeScript** | Orientado a Eventos / Saga | V8 Engine (JIT) | I/O Não-bloqueante | Coordenador de Saga, Rollback e Outbox Table |
-| **`pricing-service`** | **Clojure** | **Funcional Puro (Lisp)** | JVM Bytecode | Dados Persistentes Imutáveis / `future` | Threading Macros (`->`, `cond->`) sem mutação |
-| **`inventory-service`** | **Python 3.11** | Imperativo / Analítico | CPython Bytecode | Multi-threading + SQLite Atomic Locks | Reserva de estoque em 2 fases (`reserve`/`confirm`/`release`) |
-| **`fraud-service`** | **Rust** | **Sistemas + Funcional Tipado** | **Nativo (LLVM / Sem GC)** | Threads Nativas + *Ownership & Borrowing* | `enum` Algébricos, `match` exaustivo e `.fold()` |
-| **`payment-service`** | **Java 17** | Orientado a Objetos / Enterprise | JVM (JIT HotSpot) | Thread Pool (`ExecutorService`) + Locks | `record` imutável, Idempotência e *Double-Entry Ledger* |
-| **`notification-service`** | **Go** | Concorrente / Compilado Seguro | Binário Estático Nativo | Goroutines por Requisição + `sync.Mutex` | Geração de Chave NF-e SEFAZ (44 dígitos Mod-11) sem PHP/CGI |
+| Serviço | Porta | Linguagem | Paradigma Principal | Modelo de Concorrência | Destaque Técnico no Código |
+| :--- | :---: | :--- | :--- | :--- | :--- |
+| **`api-gateway`** | `:3000` | **Go** | Imperativo / Concorrente (CSP) | Goroutines (`M:N` scheduler) + `WaitGroup` | Health-check distribuído paralelo e Reverse Proxy |
+| **`product-service`** | `:3001` | **TypeScript** | Multi-paradigma / Assíncrono | Event-Loop Single-Thread (`async`/`await`) | Catálogo REST desacoplado com SQLite WAL |
+| **`order-service`** | `:3002` | **TypeScript** | Orientado a Eventos / Saga | I/O Não-bloqueante + Outbox Relay | Coordenador de Saga, Rollback e Publisher RabbitMQ |
+| **`pricing-service`** | `:3003` | **Clojure** | **Funcional Puro (Lisp)** | Dados Persistentes Imutáveis / `future` | Threading Macros (`->`, `cond->`) sem mutação |
+| **`inventory-service`** | `:3004` | **Python 3.11** | Imperativo / Analítico | Multi-threading + SQLite Atomic Locks | Reserva de estoque em 2 fases (`reserve`/`confirm`/`release`) |
+| **`fraud-service`** | `:3005` | **Rust** | **Sistemas + Funcional Tipado** | Threads Nativas + *Ownership & Borrowing* | `enum` Algébricos, `match` exaustivo e `.fold()` |
+| **`payment-service`** | `:3006` | **Java 17** | Orientado a Objetos / Enterprise | Thread Pool (`ExecutorService`) + Locks | `record` imutável, Idempotência e *Double-Entry Ledger* |
+| **`notification-service`** | `:3007` | **Go** | Concorrente / Compilado Seguro | Goroutines (HTTP + RabbitMQ Consumer) | Consumidor RabbitMQ + Chave NF-e SEFAZ (44 dígitos Mod-11) |
+| **`user-simulator`** | `:3080` | **Python 3.11** | Concorrente / Observabilidade | Worker Threads + `ThreadingHTTPServer` | Seeder SQLite, Bots de Tráfego e Painel Gerencial Web |
 
 ---
 
-## 6. Como Explorar e Executar o Projeto
+## 6. Painel Gerencial Web & Simulador de Usuários (`:3080`)
 
-Você pode subir todo o ecossistema via **Docker Compose** ou diretamente nos runtimes locais com os scripts automatizados:
+O serviço `user-simulator` inicializa automaticamente os dados de catálogo, cupons e estoques nos bancos SQLite ([seeder.py](file:///c:/Users/vrva2/OneDrive/Documentos/ecommerce_microservice/user-simulator/seeder.py)) e disponibiliza uma interface web em **`http://localhost:3080`** ([dashboard.html](file:///c:/Users/vrva2/OneDrive/Documentos/ecommerce_microservice/user-simulator/dashboard.html)) além de um dashboard ao vivo no terminal:
 
+- **Simulação Concorrente Automática**: Bots representando 10 perfis de clientes compram simultaneamente passando pelo API Gateway e pelos 7 microsserviços downstream.
+- **Disparo Manual de Cenários no Navegador**:
+  - ✅ **Happy Path (`OVERENGINEER25`)**: Compra aprovada passando pelas 6 linguagens + publicação RabbitMQ e emissão de NF-e.
+  - 🛡️ **Fraude por Blocklist (`UserID 123` e `456`)**: Bloqueio imediato no Rust (Score 95) com estorno automático do estoque reservado no Python.
+  - 🚨 **Fraude Comportamental / Heurística (`UserID 88`)**: Usuário legítimo fazendo pedido atípico de alto valor/volume (`>= R$ 50.000` ou `>= 15 unidades`), barrado pela análise comportamental em Rust com rollback da Saga.
+  - 💳 **Cartão Recusado (`UserID 789`)**: Aprovado no antifraude em Rust, mas recusado no serviço financeiro em Java (`HTTP 402`), revertendo a reserva de estoque no Python.
+  - 📦 **Esgotamento de Estoque (`HTTP 409`)**: Prevenção de *overselling* no Python quando o saldo disponível se esgota.
+
+---
+
+## 7. Como Executar o Projeto
+
+Você pode subir todo o ecossistema com **um único comando**, tanto via **Docker Compose** (recomendado, inclui o container do RabbitMQ) quanto localmente no Windows via **PowerShell**:
+
+### Opção 1: Via Docker Compose (Microsserviços + RabbitMQ + Simulador Web)
 ```powershell
-# Opção 1: Subir os 8 microsserviços localmente no Windows
+# Sobe os 8 microsserviços + RabbitMQ + Simulador Web (10 containers)
+docker compose up --build
+
+# Para encerrar todos os containers
+docker compose down
+```
+
+### Opção 2: Execução Local no Windows (Sem Docker, via scripts `.ps1`)
+Os scripts `.ps1` permitem rodar e testar todo o ecossistema diretamente nos runtimes locais do Windows (usando automaticamente o fallback HTTP caso o RabbitMQ não esteja instalado localmente):
+```powershell
+# 1. Inicia os 8 microsserviços (portas 3000..3007) e o Simulador Web (porta 3080)
 .\run-ecosystem.ps1
 
-# Executar a suíte de validação da Saga (Happy Path + Rollback de Antifraude + Rollback de Pagamento)
+# 2. (Opcional) Executa a bateria de testes E2E da Saga via terminal
 .\test-saga.ps1
 
-# Encerrar todos os serviços (portas 3000..3007)
+# 3. Encerra todos os processos nas portas 3000..3007 e 3080
 .\stop-all.ps1
-
-# Opção 2: Subir todo o ambiente containerizado + RabbitMQ
-docker compose up --build
 ```
+
+### Endpoints Principais após Iniciar
+- 🌐 **Painel Gerencial Web & Simulador Ao Vivo**: `http://localhost:3080`
+- 🩺 **Health Check Distribuído (API Gateway Go)**: `http://localhost:3000/api/health`
+- 🐰 **Painel Web do RabbitMQ (quando rodando via Docker)**: `http://localhost:15672` *(usuário: `guest` / senha: `guest` — fila `order.confirmed`)*
