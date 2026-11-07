@@ -1,0 +1,172 @@
+version: '3.9'
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: ecommerce-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+
+  api-gateway:
+    build: ./api-gateway
+    container_name: ecommerce-api-gateway-go
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      PRODUCT_SERVICE_URL: http://product-service:3001
+      ORDER_SERVICE_URL: http://order-service:3002
+      PRICING_SERVICE_URL: http://pricing-service:3003
+      INVENTORY_SERVICE_URL: http://inventory-service:3004
+      FRAUD_SERVICE_URL: http://fraud-service:3005
+      PAYMENT_SERVICE_URL: http://payment-service:3006
+      NOTIFICATION_SERVICE_URL: http://notification-service:3007
+    volumes:
+      - ./api-gateway/data:/app/data
+    depends_on:
+      - product-service
+      - order-service
+      - pricing-service
+      - inventory-service
+      - fraud-service
+      - payment-service
+      - notification-service
+
+  product-service:
+    build: ./product-service
+    container_name: ecommerce-product-ts
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./product-service/data:/app/data
+
+  order-service:
+    build: ./order-service
+    container_name: ecommerce-order-ts
+    ports:
+      - "3002:3002"
+    environment:
+      PORT: 3002
+      PRODUCT_SERVICE_URL: http://product-service:3001
+      PRICING_SERVICE_URL: http://pricing-service:3003
+      INVENTORY_SERVICE_URL: http://inventory-service:3004
+      FRAUD_SERVICE_URL: http://fraud-service:3005
+      PAYMENT_SERVICE_URL: http://payment-service:3006
+      NOTIFICATION_SERVICE_URL: http://notification-service:3007
+    volumes:
+      - ./order-service/data:/app/data
+    depends_on:
+      - product-service
+      - pricing-service
+      - inventory-service
+      - fraud-service
+      - payment-service
+      - notification-service
+
+  pricing-service:
+    build: ./pricing-service
+    container_name: ecommerce-pricing-clojure
+    ports:
+      - "3003:3003"
+    volumes:
+      - ./pricing-service/data:/app/data
+
+  inventory-service:
+    build: ./inventory-service
+    container_name: ecommerce-inventory-python
+    ports:
+      - "3004:3004"
+    volumes:
+      - ./inventory-service/data:/app/data
+
+  fraud-service:
+    build: ./fraud-service
+    container_name: ecommerce-fraud-rust
+    ports:
+      - "3005:3005"
+    volumes:
+      - ./fraud-service/data:/app/data
+
+  payment-service:
+    build: ./payment-service
+    container_name: ecommerce-payment-java
+    ports:
+      - "3006:3006"
+    volumes:
+      - ./payment-service/data:/app/data
+
+  notification-service:
+    build: ./notification-service
+    container_name: ecommerce-notification-go
+    ports:
+      - "3007:3007"
+    environment:
+      PORT: 3007
+    volumes:
+      - ./notification-service/data:/app/data
+
+  user-simulator:
+    build: ./user-simulator
+    container_name: ecommerce-user-simulator
+    ports:
+      - "3080:3080"
+    environment:
+      PORT: 3080
+      GATEWAY_URL: http://api-gateway:3000
+      AUTO_START: "true"
+      PRODUCTS_DB_PATH: /dbs/product-service/products.db
+      INVENTORY_DB_PATH: /dbs/inventory-service/inventory.db
+      PRICING_DB_PATH: /dbs/pricing-service/pricing.db
+      ORDERS_DB_PATH: /dbs/order-service/orders.db
+      FRAUD_DB_PATH: /dbs/fraud-service/fraud.db
+      PAYMENTS_DB_PATH: /dbs/payment-service/payments.db
+      NOTIFICATIONS_DB_PATH: /dbs/notification-service/notifications.db
+      GATEWAY_DB_PATH: /dbs/api-gateway/gateway.db
+      SIMULATOR_DB_PATH: /app/data/simulator.db
+    volumes:
+      - ./user-simulator/data:/app/data
+      - ./product-service/data:/dbs/product-service
+      - ./inventory-service/data:/dbs/inventory-service
+      - ./pricing-service/data:/dbs/pricing-service
+      - ./order-service/data:/dbs/order-service
+      - ./fraud-service/data:/dbs/fraud-service
+      - ./payment-service/data:/dbs/payment-service
+      - ./notification-service/data:/dbs/notification-service
+      - ./api-gateway/data:/dbs/api-gateway
+    depends_on:
+      - api-gateway
+
+
+  user-simulator:
+    build: ./user-simulator
+    container_name: ecommerce-user-simulator
+    ports:
+      - "3080:3080"
+    environment:
+      PORT: 3080
+      GATEWAY_URL: http://api-gateway:3000
+      AUTO_START: "true"
+      PRODUCTS_DB_PATH: /mnt/products/products.db
+      INVENTORY_DB_PATH: /mnt/inventory/inventory.db
+      PRICING_DB_PATH: /mnt/pricing/pricing.db
+      ORDERS_DB_PATH: /mnt/orders/orders.db
+      FRAUD_DB_PATH: /mnt/fraud/fraud.db
+      PAYMENTS_DB_PATH: /mnt/payments/payments.db
+      NOTIFICATIONS_DB_PATH: /mnt/notifications/notifications.db
+      GATEWAY_DB_PATH: /mnt/gateway/gateway.db
+    volumes:
+      - ./user-simulator/data:/app/data
+      - ./product-service/data:/mnt/products
+      - ./inventory-service/data:/mnt/inventory
+      - ./pricing-service/data:/mnt/pricing
+      - ./order-service/data:/mnt/orders
+      - ./fraud-service/data:/mnt/fraud
+      - ./payment-service/data:/mnt/payments
+      - ./notification-service/data:/mnt/notifications
+      - ./api-gateway/data:/mnt/gateway
+    depends_on:
+      - api-gateway
