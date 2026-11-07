@@ -1,20 +1,24 @@
 {
   "name": "order-service",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "ts-node-dev --respawn src/index.ts"
+  "version": "2.0.1",
+  "description": "Orquestrador de Pedidos (Saga Pattern Coordinator) com SQLite isolado e Transactional Outbox",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=22.23.4"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "scripts": {
+    "start": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "tsc"
+  },
   "dependencies": {
     "axios": "^1.13.1",
     "express": "^5.1.0"
   },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.3.0"
+  },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
     "@types/express": "^5.0.5",
     "@types/node": "^24.9.2",
     "ts-node-dev": "^2.0.0",
